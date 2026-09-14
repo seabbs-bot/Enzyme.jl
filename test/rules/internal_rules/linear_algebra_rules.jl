@@ -604,3 +604,52 @@ end
         end
     end
 end
+
+# `Symmetric(M) * v` goes through BLAS `symv!`, whose reverse rule dropped the
+# diagonal of the matrix adjoint. Only M's diagonal depends on t below, so the
+# gradient came back as exactly 0.0.
+# x/ref: https://github.com/EnzymeAD/Enzyme.jl/issues/3586
+symv_tri(t) = [2.0 + t -1.0 0.0; 0.0 2.0 + t -1.0; 0.0 0.0 1.0 + t]
+symv_quad(S) = (v = [1.0, 2.0, 0.5]; -0.5 * dot(v, S * v))
+symv_U(t) = symv_quad(Symmetric(symv_tri(t)))
+symv_L(t) = symv_quad(Symmetric(Matrix(symv_tri(t)'), :L))
+symv_H(t) = symv_quad(Hermitian(symv_tri(t)))
+function symv_C(t)
+    v = ComplexF64[1, 2im, 1]
+    return real(dot(v, Hermitian(complex(symv_tri(t))) * v))
+end
+function symv_32(t)
+    v = Float32[1, 2, 0.5]
+    return -0.5f0 * dot(v, Symmetric(Float32[2 -1 0; 0 2 -1; 0 0 1] + t * I) * v)
+end
+symv_x(v) = -0.5 * dot(v, Symmetric([2.1 -1.0 0.0; -1.0 2.1 -1.0; 0.0 -1.0 1.1]) * v)
+symv_ab(A) = dot([1.0, 2.0, 0.5], Symmetric(A) * [3.0, 1.0, 2.0])
+symm_U(t) = sum(Symmetric(symv_tri(t)) * Matrix(I, 3, 3))
+function symv_buf(t)
+    y = zeros(3)
+    BLAS.symv!('U', 1.0, symv_tri(t), [1.0, 2.0, 0.5], 0.0, y)
+    return sum(y)
+end
+
+@testset "Symmetric matrix-vector product" begin
+    @test autodiff(Reverse, symv_U, Active, Active(0.1))[1][1] ≈ -2.625
+    @test autodiff(Reverse, symv_L, Active, Active(0.1))[1][1] ≈ -2.625
+    @test autodiff(Reverse, symv_H, Active, Active(0.1))[1][1] ≈ -2.625
+    @test autodiff(Reverse, symv_32, Active, Active(0.1f0))[1][1] ≈ -2.625f0
+    # the return value is discarded, so y is only read back through the buffer
+    @test autodiff(Reverse, symv_buf, Active, Active(0.1))[1][1] ≈ 3.5
+    # distinct vectors, so the matrix adjoint is not symmetric before folding;
+    # the expected value is what the Matrix-stripped path gives
+    A = [2.1 -1.0 0.5; 0.0 2.1 -1.0; 0.0 0.0 1.1]
+    dA = zeros(3, 3)
+    autodiff(Reverse, symv_ab, Active, Duplicated(A, dA))
+    @test dA ≈ [3.0 7.0 3.5; 0.0 2.0 4.5; 0.0 0.0 1.0]
+    # complex Hermitian takes the hemv path, so this rule leaves it alone
+    @test autodiff(Reverse, symv_C, Active, Active(0.1))[1][1] ≈ 6.0
+    # paths that were already correct
+    @test autodiff(Forward, symv_U, Duplicated(0.1, 1.0))[1] ≈ -2.625
+    @test autodiff(Reverse, symm_U, Active, Active(0.1))[1][1] ≈ 3.0
+    dv = zeros(3)
+    autodiff(Reverse, symv_x, Active, Duplicated([1.0, 2.0, 0.5], dv))
+    @test dv ≈ [-0.1, -2.7, 1.45]
+end

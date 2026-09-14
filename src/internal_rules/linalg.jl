@@ -487,6 +487,153 @@ function EnzymeRules.reverse(
     return (nothing, nothing, nothing, dα, dβ)
 end
 
+# `symv!` mirrors one stored triangle of `A`, so for i != j the single stored
+# entry A[i,j] drives both S[i,j] and S[j,i] and collects both halves,
+# dA[i,j] += α (dy[i] x[j] + dy[j] x[i]), while A[i,i] drives only S[i,i] and
+# collects one, dA[i,i] += α dy[i] x[i].
+function _symv_accumulate_dA!(dA, uplo::AbstractChar, α, x, dy)
+    n = length(x)
+    if uplo == 'U' || uplo == 'u'
+        for j in 1:n
+            for i in 1:(j - 1)
+                dA[i, j] += α * (dy[i] * x[j] + dy[j] * x[i])
+            end
+            dA[j, j] += α * dy[j] * x[j]
+        end
+    else
+        for j in 1:n
+            dA[j, j] += α * dy[j] * x[j]
+            for i in (j + 1):n
+                dA[i, j] += α * (dy[i] * x[j] + dy[j] * x[i])
+            end
+        end
+    end
+    return dA
+end
+
+# zero seed for a scalar argument whose output shadow turned out to be constant
+function _symv_zero_seed(v::Annotation, ::Val{N}) where {N}
+    isa(v, Const) && return nothing
+    return N == 1 ? zero(v.val) : ntuple(Returns(zero(v.val)), Val(N))
+end
+
+# The tablegen BLAS rule for `symv` restores the saved diagonal of the shadow
+# after its `syr2` update instead of adding half of it back, so every diagonal
+# entry of the matrix adjoint comes out zero. `Symmetric(M) * v` routes here, so
+# a precision-matrix quadratic form silently differentiates to `0.0`.
+# Real element types only: reverse-mode tablegen BLAS covers `s` and `d`, and
+# complex `symv` already takes another path.
+# x/ref: https://github.com/EnzymeAD/Enzyme.jl/issues/3586
+function EnzymeRules.augmented_primal(
+        config::EnzymeRules.RevConfig,
+        func::Const{typeof(LinearAlgebra.BLAS.symv!)},
+        ::Type{RT},
+        uplo::Annotation{<:AbstractChar},
+        α::Annotation{<:Union{Bool, LinearAlgebra.BlasReal}},
+        A::Annotation{<:StridedMatrix{<:LinearAlgebra.BlasReal}},
+        x::Annotation{<:StridedVector{<:LinearAlgebra.BlasReal}},
+        β::Annotation{<:Union{Bool, LinearAlgebra.BlasReal}},
+        y::Annotation{<:StridedVector{<:LinearAlgebra.BlasReal}},
+    ) where {RT}
+    y_is_const = isa(y, Const)
+
+    cache_y = if !y_is_const && !isa(β, Const)
+        copy(y.val)
+    else
+        nothing
+    end
+
+    # dα needs A x, which the primal call does not leave behind once β != 0
+    cache_α = if !y_is_const && !isa(α, Const)
+        LinearAlgebra.BLAS.symv(uplo.val, one(eltype(A.val)), A.val, x.val)
+    else
+        nothing
+    end
+
+    cache_A = if EnzymeRules.overwritten(config)[4] && !y_is_const && !isa(x, Const)
+        copy(A.val)
+    else
+        nothing
+    end
+
+    cache_x = if EnzymeRules.overwritten(config)[5] && !y_is_const && !isa(A, Const)
+        copy(x.val)
+    else
+        nothing
+    end
+
+    func.val(uplo.val, α.val, A.val, x.val, β.val, y.val)
+
+    primal = EnzymeRules.needs_primal(config) ? y.val : nothing
+    shadow = EnzymeRules.needs_shadow(config) ? y.dval : nothing
+    cache = (cache_y, cache_α, cache_A, cache_x)
+    return EnzymeRules.AugmentedReturn(primal, shadow, cache)
+end
+
+function EnzymeRules.reverse(
+        config::EnzymeRules.RevConfig,
+        func::Const{typeof(LinearAlgebra.BLAS.symv!)},
+        ::Type{RT}, cache,
+        uplo::Annotation{<:AbstractChar},
+        α::Annotation{<:Union{Bool, LinearAlgebra.BlasReal}},
+        A::Annotation{<:StridedMatrix{<:LinearAlgebra.BlasReal}},
+        x::Annotation{<:StridedVector{<:LinearAlgebra.BlasReal}},
+        β::Annotation{<:Union{Bool, LinearAlgebra.BlasReal}},
+        y::Annotation{<:StridedVector{<:LinearAlgebra.BlasReal}},
+    ) where {RT}
+    cache_y, cache_α, cache_A, cache_x = cache
+    Aval = cache_A === nothing ? A.val : cache_A
+    xval = cache_x === nothing ? x.val : cache_x
+
+    rta = EnzymeRules.runtime_activity(config)
+    A_is_const = isa(A, Const) || (rta && A.dval === A.val)
+    x_is_const = isa(x, Const) || (rta && x.dval === x.val)
+    y_is_const = isa(y, Const) || (rta && y.dval === y.val)
+
+    N = EnzymeRules.width(config)
+    if y_is_const
+        dα = _symv_zero_seed(α, Val(N))
+        dβ = _symv_zero_seed(β, Val(N))
+        return (nothing, dα, nothing, nothing, dβ, nothing)
+    end
+
+    dαs = if isa(α, Const)
+        nothing
+    else
+        ntuple(Val(N)) do i
+            Base.@_inline_meta
+            dot(N == 1 ? y.dval : y.dval[i], cache_α)
+        end
+    end
+
+    dβs = if isa(β, Const)
+        nothing
+    else
+        ntuple(Val(N)) do i
+            Base.@_inline_meta
+            dot(N == 1 ? y.dval : y.dval[i], cache_y)
+        end
+    end
+
+    for i in 1:N
+        dy = N == 1 ? y.dval : y.dval[i]
+        if !A_is_const
+            dA = N == 1 ? A.dval : A.dval[i]
+            _symv_accumulate_dA!(dA, uplo.val, α.val, xval, dy)
+        end
+        if !x_is_const
+            # dx += α A dy; A is symmetric, so no transpose is needed
+            dx = N == 1 ? x.dval : x.dval[i]
+            LinearAlgebra.BLAS.symv!(uplo.val, α.val, Aval, dy, one(eltype(dx)), dx)
+        end
+        dy .*= β.val
+    end
+
+    dα = isa(α, Const) ? nothing : (N == 1 ? dαs[1] : dαs)
+    dβ = isa(β, Const) ? nothing : (N == 1 ? dβs[1] : dβs)
+    return (nothing, dα, nothing, nothing, dβ, nothing)
+end
+
 function EnzymeRules.augmented_primal(
     config::EnzymeRules.RevConfig,
     func::Const{typeof(det)},
