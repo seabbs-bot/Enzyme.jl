@@ -315,6 +315,8 @@ When writing an [`EnzymeRules.@easy_rule`](@ref) one first describes the functio
 
 One can also define certain arguments as not having a derivative via `@Constant`. 
 
+If an argument does have a derivative but the rule does not implement it, mark it `@NotImplemented` rather than `@Constant`. `@Constant` answers zero, which is silently wrong; `@NotImplemented` makes the gap visible. Forward mode throws `UnimplementedPartial` unless the shadow is zero. Reverse mode returns `NaN` for that argument when the seed is non-zero, because an `Active` annotation is not evidence that the caller wants the derivative.
+
 For more information see the [`EnzymeRules.@easy_rule`](@ref) documentation.
 
 ```jldoctest easyrules

@@ -109,6 +109,85 @@ Specifically, perform prev + conj(partial * conj(dx)), returning the result or r
 function multiply_rev_into end
 
 """
+    UnimplementedPartial(f, argname, argnum)
+
+Thrown by a rule defined with [`@easy_rule`](@ref) when a partial derivative marked
+`@NotImplemented` would contribute to the result of a forward-mode derivative.
+
+`f` is the function the rule applies to, `argname` the name the rule gave the
+argument, and `argnum` its one-based position in the call.
+"""
+struct UnimplementedPartial{F} <: Exception
+    f::F
+    argname::Symbol
+    argnum::Int
+end
+
+function Base.showerror(io::IO, e::UnimplementedPartial)
+    print(io, "UnimplementedPartial: the Enzyme rule for ")
+    print(io, e.f)
+    print(io, " does not implement the partial derivative with respect to argument ")
+    print(io, e.argnum)
+    print(io, " (")
+    print(io, e.argname)
+    print(io, ").\n")
+    print(io, "Differentiate with respect to the other arguments only (mark this one `Const`), ")
+    return print(io, "or supply a custom rule that implements this partial.")
+end
+
+"""
+    check_implemented_fwd(dx, f, argname, argnum)
+
+Internal function.
+
+Forward-mode guard for a partial marked `@NotImplemented`. A zero shadow cannot
+influence the result, so it is allowed through; anything else is an error.
+"""
+@inline function check_implemented_fwd(dx, @nospecialize(f), argname::Symbol, argnum::Int)
+    iszero(dx) && return nothing
+    throw(UnimplementedPartial(f, argname, argnum))
+    return nothing
+end
+
+"""
+    unimplemented_rev_into(prev, dΩ)
+
+Internal function.
+
+Reverse-mode counterpart of [`check_implemented_fwd`](@ref). Activity analysis
+over-approximates, so an `Active` argument is not evidence that the caller wants
+this derivative and we must not throw. A zero seed contributes nothing and is
+left alone; otherwise the slot is poisoned with `NaN` so that a derivative which
+is really consumed is visibly wrong rather than silently zero.
+"""
+@inline function unimplemented_rev_into(prev, dΩ)
+    iszero(dΩ) && return prev
+    return _nan_like(prev)
+end
+
+"""
+    _opaque_nan()
+
+Internal function.
+
+`NaN` behind an optimisation barrier. Enzyme's reverse-mode accumulation carries
+`nnan`, so a `NaN` the optimiser can see as a literal folds to poison and then to
+zero, which is exactly the silent zero this marker exists to avoid. Loading it
+from a mutable global forces the value to be produced at run time.
+"""
+const _NAN_BOX = Ref(NaN)
+@inline _opaque_nan() = _NAN_BOX[]
+
+@inline _nan_like(prev::AbstractFloat) = oftype(prev, _opaque_nan())
+@inline function _nan_like(prev::Complex{T}) where {T}
+    return Complex{T}(T(_opaque_nan()), T(_opaque_nan()))
+end
+@inline function _nan_like(prev::AbstractArray)
+    fill!(prev, _nan_like(zero(eltype(prev))))
+    return prev
+end
+
+"""
     _normalize_scalarrules_macro_input(call, maybe_setup, partials)
 
 Internal function.
@@ -149,6 +228,41 @@ function _normalize_scalarrules_macro_input(call, maybe_setup, partials)
     return call, setup_stmts, inputs, input_names, normal_inputs, partials
 end
 
+"""
+    _split_partials(partials, input_names, ninputs)
+
+Internal function.
+
+Split the per-output partial expressions into the ones that are summed into the
+derivative (`tosum0`) and the ones marked `@NotImplemented` (`notimpl0`, as
+`(argument number, argument name)` pairs). Partials marked `@Constant` appear in
+neither: they are genuinely absent, so a zero is the right answer for them.
+"""
+function _split_partials(partials, input_names, ninputs)
+    tosum0 = Vector{Tuple{Int, Symbol, Any}}[]
+    notimpl0 = Vector{Tuple{Int, Symbol}}[]
+
+    for partial0 in partials
+        @assert partial0 isa Array && length(partial0) == ninputs
+        tosum = Tuple{Int, Symbol, Any}[]
+        notimpl = Tuple{Int, Symbol}[]
+        push!(tosum0, tosum)
+        push!(notimpl0, notimpl)
+        for (i, (p, sname)) in enumerate(zip(partial0, input_names))
+            if Meta.isexpr(p, :macrocall) && p.args[1] == Symbol("@Constant")
+                continue
+            end
+            if Meta.isexpr(p, :macrocall) && p.args[1] == Symbol("@NotImplemented")
+                push!(notimpl, (i, Symbol(String(sname)[(length("ann_") + 1):end])))
+                continue
+            end
+            push!(tosum, (i, sname, p))
+        end
+    end
+
+    return tosum0, notimpl0
+end
+
 function scalar_frule_expr(__source__, f, call, setup_stmts, inputs, input_names, partials)
 
     call2 = Expr(:call, esc(:f), call.args[2:end]...)
@@ -162,19 +276,7 @@ function scalar_frule_expr(__source__, f, call, setup_stmts, inputs, input_names
         push!(exprs, Expr(:(=), rname, :($sname.val)))
     end
 
-    tosum0 = Vector{Tuple{Int, Symbol, Any}}[]
-
-    for (o, partial0) in enumerate(partials)
-        @assert partial0 isa Array && length(partial0) == length(inputs)
-        tosum = Tuple{Int, Symbol, Any}[]
-        push!(tosum0, tosum)
-        for (i, (p, sname)) in enumerate(zip(partial0, input_names))
-            if Meta.isexpr(p, :macrocall) && p.args[1] == Symbol("@Constant")
-                continue
-            end
-            push!(tosum, (i , sname, p))
-        end
-    end
+    tosum0, notimpl0 = _split_partials(partials, input_names, length(inputs))
 
     actives = Expr[]
     for ann_name in input_names
@@ -198,6 +300,7 @@ function scalar_frule_expr(__source__, f, call, setup_stmts, inputs, input_names
             end
             
             tosum0 = $tosum0
+            notimpl0 = $notimpl0
 
             N = $N
             W = width(config)
@@ -205,6 +308,32 @@ function scalar_frule_expr(__source__, f, call, setup_stmts, inputs, input_names
             actives = Union{Nothing, Expr}[$(actives...)]
 
             if needs_shadow(config)
+                # A partial marked `@NotImplemented` contributes nothing when its shadow is
+                # zero, and is an error otherwise. Nothing is emitted when no partial is
+                # marked, nor for arguments Enzyme already knows to be `Const`.
+                ni_guarded = zeros(Bool, N)
+                for notimpl in notimpl0
+                    for (i, argname) in notimpl
+                        if actives[i] isa Nothing || ni_guarded[i]
+                            continue
+                        end
+                        ni_guarded[i] = true
+                        for w in 1:W
+                            dval = actives[i]
+                            if W != 1
+                                dval = Expr(:call, getfield, dval, w)
+                            end
+                            push!(
+                                gensetup,
+                                Expr(
+                                    :call, check_implemented_fwd, dval, :f,
+                                    QuoteNode(argname), i
+                                )
+                            )
+                        end
+                    end
+                end
+
                 outsyms = Matrix{Symbol}(undef, length(tosum0), W)
                 visited = zeros(Bool, length(tosum0), N)
                 for (o, tosum) in enumerate(tosum0)
@@ -340,19 +469,7 @@ function scalar_rrule_expr(__source__, f, call, setup_stmts, inputs, input_names
                 )))
     end
 
-    tosum0 = Vector{Tuple{Int, Symbol, Any}}[]
-
-    for (o, partial0) in enumerate(partials)
-        @assert partial0 isa Array && length(partial0) == length(inputs)
-        tosum = Tuple{Int, Symbol, Any}[]
-        push!(tosum0, tosum)
-        for (i, (p, sname)) in enumerate(zip(partial0, input_names))
-            if Meta.isexpr(p, :macrocall) && p.args[1] == Symbol("@Constant")
-                continue
-            end
-            push!(tosum, (i , sname, p))
-        end
-    end
+    tosum0, notimpl0 = _split_partials(partials, input_names, length(inputs))
 
     actives = Expr[]
     for ann_name in input_names
@@ -531,6 +648,7 @@ function scalar_rrule_expr(__source__, f, call, setup_stmts, inputs, input_names
             inp_names = String[($((String.(input_names))...),)...]
 
             tosum0 = $tosum0
+            notimpl0 = $notimpl0
 
             N = $N
             W = width(config)
@@ -648,6 +766,50 @@ function scalar_rrule_expr(__source__, f, call, setup_stmts, inputs, input_names
                     end
                 end
 
+                # A partial marked `@NotImplemented` must not throw here. `Active` only
+                # means activity analysis could not prove the argument inactive, so
+                # erroring would reject correct code. Poison the slot with `NaN` instead,
+                # unless the seed is zero, in which case the partial cannot matter.
+                ni_outs = Int[]
+                for (o, notimpl) in enumerate(notimpl0)
+                    for (i, argname) in notimpl
+                        if i == inum
+                            push!(ni_outs, o)
+                        end
+                    end
+                end
+
+                if !isempty(ni_outs)
+                    for w in 1:W
+                        inexpr = Symbol("insym_", string(inum), "_", string(w))
+                        if !seen && !(inp_types[inum] <: Active)
+                            dexpr = Expr(:call, getfield, Symbol(inp_names[inum]), 2)
+                            if W != 1
+                                dexpr = Expr(:call, getfield, dexpr, w)
+                            end
+                            push!(gensetup, Expr(:(=), inexpr, dexpr))
+                        end
+                        insyms[inum, w] = inexpr
+
+                        for o in ni_outs
+                            dval = :dΩ
+                            if W != 1
+                                dval = Expr(:call, getfield, dval, w)
+                            end
+                            if RT <: Tuple
+                                dval = Expr(:call, getfield, dval, o)
+                            end
+                            push!(
+                                gensetup,
+                                Expr(
+                                    :(=), inexpr,
+                                    Expr(:call, unimplemented_rev_into, inexpr, dval)
+                                )
+                            )
+                        end
+                    end
+                end
+
                 if !(inp_types[inum] <: Active)
                     push!(results, nothing)
                 elseif W == 1
@@ -726,6 +888,16 @@ If a specific argument has no partial derivative, then all corresponding argumen
              (@Constant, ∂f₂_∂x, ...),
              ...)
 ```
+
+If a specific argument *has* a partial derivative but this rule does not implement it, mark it `@NotImplemented` instead. `@Constant` would answer zero, which is silently wrong; `@NotImplemented` makes the omission visible.
+
+```julia
+@easy_rule(f(nu, x),
+             (@NotImplemented, ∂f_∂x),
+             ...)
+```
+
+In forward mode the partial only matters when its shadow is non-zero, so a `Const` argument or a zero shadow is allowed through and anything else throws [`UnimplementedPartial`](@ref). In reverse mode an `Active` argument is not evidence that the caller wants the derivative, because activity analysis over-approximates, so the rule does not throw. It returns `NaN` for that argument when the seed is non-zero, and zero when the seed is zero.
 
 # Examples
 
