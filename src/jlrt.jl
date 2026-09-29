@@ -386,7 +386,7 @@ function load_if_mixed(oval::OT, val::VT) where {OT, VT}
 end
 
 function val_from_byref_if_mixed(B::LLVM.IRBuilder, gutils::GradientUtils, @nospecialize(oval::LLVM.Value), @nospecialize(val::LLVM.Value))::LLVM.Value
-    world = enzyme_extract_world(LLVM.parent(position(B)))
+    world = enzyme_world()
     legal, TT, _ = abs_typeof(oval)
     if !legal
         legal, TT, _ = abs_typeof(oval, true)
@@ -433,7 +433,7 @@ end
 end
 
 function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    world = enzyme_extract_world(LLVM.parent(position(B)))
+    world = enzyme_world()
     legal, TT, _ = abs_typeof(val)
     if !legal
         legal, TT, _ = abs_typeof(val, true)
@@ -453,6 +453,146 @@ function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Valu
     else
         return val
     end
+end
+
+# Largest `count` for which `define_ntuple_type!` builds `NTuple{count, T}`
+# from a stack array; larger counts go through a heap-allocated svec.
+const NTUPLE_TYPE_STACK_SIZE = 64
+
+"""
+    declare_ntuple_type!(mod::LLVM.Module)
+
+Declare `julia.enzyme.ntuple_type(T, count)`, which returns `NTuple{count, T}`.
+It stays a bare declaration while Enzyme differentiates, including in the
+module kept for nested differentiation, so that no optimization drops its
+constant `T` argument and `abs_ntuple_type` can always recover `T`.
+`define_ntuple_type!` gives it a body after differentiation.
+"""
+function declare_ntuple_type!(mod::LLVM.Module)
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    T_size = convert(LLVMType, Int)
+    FT = LLVM.FunctionType(T_prjlvalue, [T_prjlvalue, T_size])
+    # The result depends only on the arguments and is interned, so the call can be
+    # treated as readnone, which also lets LLVM CSE it and hoist it out of loops.
+    memory = if LLVM.version().major <= 15
+        EnumAttribute("readnone", 0)
+    else
+        EnumAttribute("memory", NoEffects.data)
+    end
+    fn, _ = get_function!(
+        mod, "julia.enzyme.ntuple_type", FT,
+        LLVM.Attribute[
+            memory,
+            EnumAttribute("nounwind", 0),
+            StringAttribute("enzyme_inactive"),
+            StringAttribute("enzyme_no_escaping_allocation"),
+        ]
+    )
+    if isa(fn, LLVM.Function) && isempty(collect(parameter_attributes(fn, 1)))
+        push!(parameter_attributes(fn, 1), EnumAttribute("nocapture", 0))
+        push!(parameter_attributes(fn, 1), EnumAttribute("readonly", 0))
+    end
+    return fn, FT
+end
+
+"""
+    define_ntuple_type!(mod::LLVM.Module)
+
+Give `julia.enzyme.ntuple_type`, if `mod` declares it, an `alwaysinline` body.
+For `count <= NTUPLE_TYPE_STACK_SIZE` it fills a stack array with `T` and calls
+`jl_apply_tuple_type_v`; otherwise it calls
+`jl_apply_tuple_type(jl_svec_fill(count, T))`. Both find the interned type
+several times faster than `jl_f_apply_type(NTuple, count, T)`, which first
+instantiates the `NTuple` `UnionAll`. Call this once differentiation is done,
+after the module for nested differentiation has been saved.
+"""
+function define_ntuple_type!(mod::LLVM.Module)
+    haskey(functions(mod), "julia.enzyme.ntuple_type") || return
+    fn = functions(mod)["julia.enzyme.ntuple_type"]
+    isempty(blocks(fn)) || return
+
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    T_pjlvalue = LLVM.PointerType(T_jlvalue)
+    T_size = convert(LLVMType, Int)
+
+    linkage!(fn, LLVM.API.LLVMInternalLinkage)
+    push!(function_attributes(fn), EnumAttribute("alwaysinline", 0))
+
+    let builder = IRBuilder()
+        entry = BasicBlock(fn, "entry")
+        prefill = BasicBlock(fn, "prefill")
+        loop = BasicBlock(fn, "fill")
+        stack = BasicBlock(fn, "stack")
+        heap = BasicBlock(fn, "heap")
+        eltype, n = collect(parameters(fn))
+
+        position!(builder, entry)
+        br!(builder, icmp!(builder, LLVM.API.LLVMIntULE, n, LLVM.ConstantInt(T_size, NTUPLE_TYPE_STACK_SIZE)), prefill, heap)
+
+        position!(builder, prefill)
+        # `T` is a type, which is never freed, so the untracked slots need no rooting
+        # of their own; `T` itself is rooted across the call by `jl_roots`.
+        buf = array_alloca!(builder, T_pjlvalue, n, "ntuple_params")
+        raw = emit_pointerfromobjref!(builder, addrspacecast!(builder, eltype, LLVM.PointerType(T_jlvalue, Derived)))
+        br!(builder, icmp!(builder, LLVM.API.LLVMIntEQ, n, LLVM.ConstantInt(T_size, 0)), stack, loop)
+
+        position!(builder, loop)
+        idx = LLVM.phi!(builder, T_size, "idx")
+        store!(builder, raw, inbounds_gep!(builder, T_pjlvalue, buf, LLVM.Value[idx]))
+        next = add!(builder, idx, LLVM.ConstantInt(T_size, 1))
+        append!(LLVM.incoming(idx), [(LLVM.ConstantInt(T_size, 0), prefill), (next, loop)])
+        br!(builder, icmp!(builder, LLVM.API.LLVMIntULT, next, n), loop, stack)
+
+        position!(builder, stack)
+        memory = if LLVM.version().major <= 15
+            EnumAttribute("inaccessiblemem_or_argmemonly", 0)
+        else
+            EnumAttribute("memory", ReadArgMemReadWriteInaccessibleEffects.data)
+        end
+        apply_tuple_v, apply_tuple_v_FT = get_function!(
+            mod, "ijl_apply_tuple_type_v", LLVM.FunctionType(T_prjlvalue, [LLVM.PointerType(T_pjlvalue), T_size]),
+            LLVM.Attribute[memory, EnumAttribute("nounwind", 0)]
+        )
+        if isa(apply_tuple_v, LLVM.Function) && isempty(collect(parameter_attributes(apply_tuple_v, 1)))
+            push!(parameter_attributes(apply_tuple_v, 1), EnumAttribute("readonly", 0))
+            push!(parameter_attributes(apply_tuple_v, 1), EnumAttribute("nocapture", 0))
+        end
+        roots = if isdefined(LLVM, :OperandBundleDef)
+            [LLVM.OperandBundleDef("jl_roots", LLVM.Value[eltype])]
+        else
+            [LLVM.OperandBundle("jl_roots", LLVM.Value[eltype])]
+        end
+        ret!(builder, call!(builder, apply_tuple_v_FT, apply_tuple_v, LLVM.Value[buf, n], roots))
+
+        position!(builder, heap)
+        svec_fill, svec_fill_FT = get_function!(mod, "ijl_svec_fill", LLVM.FunctionType(T_prjlvalue, [T_size, T_prjlvalue]))
+        params = call!(builder, svec_fill_FT, svec_fill, LLVM.Value[n, eltype])
+        tag = @static if VERSION >= v"1.11"
+            # The tape element type `T` is a valid type parameter, so skip the check.
+            T_int32 = LLVM.Int32Type()
+            apply_tuple, apply_tuple_FT = get_function!(mod, "ijl_apply_tuple_type", LLVM.FunctionType(T_prjlvalue, [T_prjlvalue, T_int32]))
+            call!(builder, apply_tuple_FT, apply_tuple, LLVM.Value[params, LLVM.ConstantInt(T_int32, 0)])
+        else
+            apply_tuple, apply_tuple_FT = get_function!(mod, "ijl_apply_tuple_type", LLVM.FunctionType(T_prjlvalue, [T_prjlvalue]))
+            call!(builder, apply_tuple_FT, apply_tuple, LLVM.Value[params])
+        end
+        ret!(builder, tag)
+        dispose(builder)
+    end
+    return
+end
+
+"""
+    emit_ntuple_type!(B, count, T) -> LLVM.Value
+
+Emit the type `NTuple{count, T}` for a runtime `count::Int` as a call to
+`julia.enzyme.ntuple_type` (see `declare_ntuple_type!` and `define_ntuple_type!`).
+"""
+function emit_ntuple_type!(B::LLVM.IRBuilder, @nospecialize(count::LLVM.Value), @nospecialize(T::Type))::LLVM.Value
+    fn, FT = declare_ntuple_type!(LLVM.parent(LLVM.parent(position(B))))
+    return call!(B, FT, fn, LLVM.Value[unsafe_to_llvm(B, T), count])
 end
 
 function emit_apply_type!(B::LLVM.IRBuilder, @nospecialize(Ty::Type), args::Vector{LLVM.Value})::LLVM.Value
@@ -586,7 +726,7 @@ function emit_methodinstance!(B::LLVM.IRBuilder, @nospecialize(func), args::Vect
     fn = LLVM.parent(curent_bb)
     mod = LLVM.parent(fn)
 
-    world = enzyme_extract_world(fn)
+    world = enzyme_world()
 
     sizeT = convert(LLVMType, Csize_t)
     psizeT = LLVM.PointerType(sizeT)
@@ -672,6 +812,18 @@ function emit_writebarrier!(B::LLVM.IRBuilder, T::Vector{LLVM.Value})
     return call!(B, FT, func, T)
 end
 
+
+# Cast `ptr` to a pointer to `ST`, for a GEP into the fields of `ST`. Julia does not allow
+# a GEP on a GC-tracked pointer. Thus, a tracked pointer also gets a cast to the derived
+# address space.
+function struct_ptr!(B::LLVM.IRBuilder, @nospecialize(ptr::LLVM.Value), @nospecialize(ST::LLVM.LLVMType))
+    as = LLVM.addrspace(LLVM.value_type(ptr))
+    ptr = LLVM.pointercast!(B, ptr, LLVM.PointerType(ST, as))
+    if as == Tracked
+        ptr = LLVM.addrspacecast!(B, ptr, LLVM.PointerType(ST, Derived))
+    end
+    return ptr
+end
 
 function get_array_struct()
     @static if VERSION < v"1.11-"
@@ -770,11 +922,7 @@ end
 
 function get_memory_data(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     mty = get_memory_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(mty, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, mty)
     v = inbounds_gep!(
         B,
         mty,
@@ -843,10 +991,13 @@ function get_datatype_struct()
     #     uint16_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
     #     uint16_t smalltag:6; // whether this type has a small-tag optimization
     # } jl_datatype_t;
-	jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
-	i32 = LLVM.IntType(32)
-	i16 = LLVM.IntType(16)
-	return LLVM.StructType([jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, i32, i16]; packed = true)
+    jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
+    # The layout field points to memory that the GC does not manage.
+    # Thus it is a pointer in address space 0 and not in address space 10.
+    lptr = LLVM.PointerType(get_layout_struct())
+    i32 = LLVM.IntType(32)
+    i16 = LLVM.IntType(16)
+    return LLVM.StructType([jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, lptr, i32, i16]; packed = true)
 end
 
 function get_array_data(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
@@ -863,11 +1014,7 @@ end
 function get_array_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     ST = get_array_struct()
     elsz = LLVM.IntType(16)
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -878,24 +1025,24 @@ function get_array_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
 end
 
 function emit_layout_of_type!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value))
-	legal, JTy = absint(ty)
-	ls = get_layout_struct()
-	lptr = LLVM.PointerType(ls, 10)
-	if legal
-		JTy = unbind(JTy)
-		return LLVM.const_inttoptr(LLVM.ConstantInt(Base.reinterpret(UInt, JTy.layout)), lptr)
-	end
-	@assert !isa(ty, LLVM.ConstantExpr)
-	@assert !isa(ty, LLVM.Constant)
-	dt = get_datatype_struct()
-	lty = bitcast!(B, ty, LLVM.PointerType(dt, addrspace(value_type(ty))))
-	layoutp = inbounds_gep!(B, dt, lty, 
+    legal, JTy = absint(ty)
+    # The layout is not a GC object. Do not use address space 10 for it,
+    # because LateLowerGCFrame then puts the pointer in a GC frame slot
+    # and the GC writes mark bits before the layout.
+    lptr = LLVM.PointerType(get_layout_struct())
+    if legal
+        JTy = unbind(JTy)
+        return LLVM.const_inttoptr(LLVM.ConstantInt(Base.reinterpret(UInt, JTy.layout)), lptr)
+    end
+    @assert !isa(ty, LLVM.ConstantExpr)
+    @assert !isa(ty, LLVM.Constant)
+    dt = get_datatype_struct()
+    lty = struct_ptr!(B, ty, dt)
+    layoutp = inbounds_gep!(
+        B, dt, lty,
         LLVM.Value[LLVM.ConstantInt(Int32(0)), LLVM.ConstantInt(Int32(5))],
-	)
-	jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
-	layout = load!(B, jlvaluet, layoutp)
-    layout = bitcast!(B, layout, lptr)
-	return layout
+    )
+    return load!(B, lptr, layoutp)
 end
 
 function emit_type_layout_elsz!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value))
@@ -946,11 +1093,7 @@ function get_array_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
         end
     end
     ST = get_array_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -987,11 +1130,7 @@ function get_memory_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
         end
     end
     ST = get_memory_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -1048,11 +1187,7 @@ end
 
 function get_array_nrows(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     ST = get_array_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,

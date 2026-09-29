@@ -188,6 +188,44 @@ end
     @test all(dA .== exp(1.f0))
 end
 
+# `tape_type` with a parent job, as KernelAbstractions' reverse rule calls it, gives the tape of the
+# derivative that the kernel then compiles with `autodiff_deferred_thunk`, a deferred job. For `exp`,
+# a top-level compilation gives another tape than the deferred one, and the kernel's compilation
+# fails with `expectedTapeType === TapeType`.
+function exp_store!(x, y)
+    x[1] = exp(y[1]) * y[1]
+    return nothing
+end
+const exp_tape_mode = ReverseSplitModified(ReverseSplitWithPrimal, Val((true, true, true)))
+function exp_aug!(tape, x, dx, y, dy, ::Val{TT}) where {TT}
+    fwd, _ = autodiff_deferred_thunk(
+        exp_tape_mode, TT, Const{typeof(exp_store!)}, Const{Nothing},
+        Duplicated{typeof(x)}, Duplicated{typeof(y)}
+    )
+    tape[1] = fwd(Const(exp_store!), Duplicated(x, dx), Duplicated(y, dy))[1]
+    return nothing
+end
+function exp_rev!(tape, x, dx, y, dy, ::Val{TT}) where {TT}
+    _, rev = autodiff_deferred_thunk(
+        exp_tape_mode, TT, Const{typeof(exp_store!)}, Const{Nothing},
+        Duplicated{typeof(x)}, Duplicated{typeof(y)}
+    )
+    rev(Const(exp_store!), Duplicated(x, dx), Duplicated(y, dy), tape[1])
+    return nothing
+end
+@testset "tape_type with a CUDA parent job, as the kernel's derivative, $T" for T in (Float32, Float64)
+    job = Enzyme.EnzymeCore.compiler_job_from_backend(CUDA.CUDABackend(), typeof(() -> return), Tuple{})
+    TT = Enzyme.tape_type(
+        job, exp_tape_mode, Const{typeof(exp_store!)}, Const{Nothing},
+        Duplicated{CuDeviceVector{T, 1}}, Duplicated{CuDeviceVector{T, 1}}
+    )
+    x = CUDA.zeros(T, 1); dx = CUDA.ones(T, 1); y = CuArray(T[0.7]); dy = CUDA.zeros(T, 1)
+    tape = CuArray{TT}(undef, 1)
+    @cuda exp_aug!(tape, x, dx, y, dy, Val(TT))
+    @cuda exp_rev!(tape, x, dx, y, dy, Val(TT))
+    @test Array(dy)[1] ≈ exp(T(0.7)) * (1 + T(0.7))
+end
+
 function cos_kernel(A)
     i = threadIdx().x
     if i <= length(A)
@@ -413,5 +451,23 @@ test/ext/jlarrays.jl for why, and for the rest of the coverage).
             Duplicated(cu(zeros(Float32, n, 3)), cu(ones(Float32, n, 3))),
             Duplicated(Symmetric(cu(X0), :U), Symmetric(dX, :U)), Const(cu(randn(Float32, n, 3))),
         )
+    end
+end
+
+# A view or reshape shares the buffer of its parent and retains it. The shadow view
+# releases the shadow buffer when it is finalized, so the shadow buffer must be retained too.
+@testset "view and reshape keep the shadow buffer alive" begin
+    refcount(a) = a.data.rc.count[]
+    @testset "$name" for (name, f) in (
+            ("view", x -> sum(view(x, 1:2))),
+            ("reshape", x -> sum(reshape(x, 2, :))),
+        )
+        x = CUDA.ones(Float64, 4)
+        dx = CUDA.zeros(Float64, 4)
+        autodiff(Reverse, f, Active, Duplicated(x, dx))
+        GC.gc(true)
+        @test refcount(x) == 1
+        @test refcount(dx) == 1
+        @test Array(dx) == (name == "view" ? [1.0, 1.0, 0.0, 0.0] : ones(4))
     end
 end

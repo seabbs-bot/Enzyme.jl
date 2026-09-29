@@ -136,7 +136,7 @@ const LastInaWorld = Ref(Base.IdSet{Type}())
 
 function EnzymeInterpreter(
     cache_or_token,
-    mt::Union{Nothing,Core.MethodTable},
+    mt::Union{Nothing, Core.MethodTable, Core.Compiler.MethodTableView},
     world::UInt,
     forward_rules::Bool,
     reverse_rules::Bool,
@@ -203,9 +203,17 @@ function EnzymeInterpreter(
         end
     end
 
+    # accept a method table view as is, e.g. from `GPUCompiler.method_table_view`, which a
+    # back-end may use to stack several method tables
+    if mt === nothing
+        mt = Core.Compiler.InternalMethodTable(world)
+    elseif mt isa Core.MethodTable
+        mt = Core.Compiler.OverlayMethodTable(world, mt)
+    end
+
     return EnzymeInterpreter(
         cache_or_token,
-    mt == nothing ? Core.Compiler.InternalMethodTable(world) : Core.Compiler.OverlayMethodTable(world, mt),
+        mt,
 
         # Initially empty cache
         (@static if isdefined(Core.Compiler, :InferenceCache)
@@ -231,7 +239,7 @@ end
 
 EnzymeInterpreter(
     cache_or_token,
-    mt::Union{Nothing,Core.MethodTable},
+    mt::Union{Nothing, Core.MethodTable, Core.Compiler.MethodTableView},
     world::UInt,
     mode::API.CDerivativeMode,
     inactive_rules::Bool,
@@ -1084,7 +1092,15 @@ end
     end
 end
 
-@inline function override_bc_mapreduce(f, op, ::Base.IndexLinear, A::Base.AbstractArrayOrBroadcasted)
+# The redirect in `abstract_call_known` is only valid once inlined, so this shim
+# must stay `@inline`. The body lives in a separate, not-inlined function so that
+# callers such as `Base._mapreduce_dim`, which only pass `f` along, stay small
+# enough to inline. Otherwise they are compiled despecialized on `f::Function`
+# and called dynamically (e.g. under `sum(log, x)`).
+@inline override_bc_mapreduce(f, op, ::Base.IndexLinear, A::Base.AbstractArrayOrBroadcasted) =
+    bc_mapreduce(f, op, A)
+
+function bc_mapreduce(f::F, op::OP, A::Base.AbstractArrayOrBroadcasted) where {F, OP}
     inds = Base.LinearIndices(A)
     n = length(inds)
     if n == 0

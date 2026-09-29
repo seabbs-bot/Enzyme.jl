@@ -216,3 +216,134 @@ end
         @test Enzyme.gradient(set_runtime_activity(Reverse), absint_run_world, [1.0])[1] ≈ [3.0]
     end
 end
+
+struct PaddedMixed
+    data::Vector{Float64}
+    sp::Tuple{Int, Bool}
+end
+
+@inline function absint_copy_zip(A)
+    dst = similar(A)
+    @inbounds for (i, a) in zip(eachindex(dst), A)
+        dst[i] = a
+    end
+    return dst
+end
+
+function absint_padded_copies!(out, v)
+    src = [PaddedMixed(v .* i, (i, isodd(i))) for i in 1:3]
+    out[1] = absint_copy_zip(src)
+    out[2] = absint_copy_zip(src)
+    s = 0.0
+    for m in out[1]
+        s += sum(m.data)
+    end
+    for m in out[2]
+        s += sum(m.data)
+    end
+    return s
+end
+
+@testset "Absint negative offset memcpy into array of padded structs" begin
+    v = [1.0, 2.0, 3.0]
+    dv = zero(v)
+    out = Vector{Vector{PaddedMixed}}(undef, 2)
+    dout = Vector{Vector{PaddedMixed}}(undef, 2)
+    autodiff(Reverse, absint_padded_copies!, Active, Duplicated(out, dout), Duplicated(v, dv))
+    @test dv ≈ [12.0, 12.0, 12.0]
+    for k in 1:2
+        @test [m.sp for m in dout[k]] == [m.sp for m in out[k]]
+    end
+end
+
+struct AbsintInlineField
+    data::Vector{Float64}
+    pad::NTuple{22, Float64}
+end
+
+mutable struct AbsintWideModel
+    pad::NTuple{70, Float64}
+    vel::@NamedTuple{a::AbsintInlineField, b::AbsintInlineField, c::AbsintInlineField, d::AbsintInlineField}
+    x::Float64
+end
+
+@noinline function absint_consume_wide(vel, n)
+    s = 0.0
+    for i in 1:n
+        s += vel.d.pad[1] * vel.a.data[i] * vel.d.data[i]
+    end
+    return s
+end
+
+@noinline function absint_wide_tendencies(m::AbsintWideModel, callbacks)
+    vel = m.vel
+    s = absint_consume_wide(vel, length(vel.a.data))
+    for cb in callbacks
+        cb(m)
+    end
+    return s
+end
+
+absint_wide_loss(m) = absint_wide_tendencies(m, Any[])
+
+absint_wide_field(v, p) = AbsintInlineField(v, ntuple(Returns(p), 22))
+
+@testset "Absint memcpy out of an object past the type analysis offset limit" begin
+    # `m.vel` is 736 bytes at offset 560, copied out piecewise: each tracked
+    # pointer is loaded on its own and the runs of floats between them are
+    # memcpy'd. Both the source offset and the fresh stack slot it lands in lie
+    # beyond what type analysis keeps for either object, so the copy must be
+    # typed from the Julia layout of the source.
+    m = AbsintWideModel(
+        ntuple(Returns(0.0), 70),
+        (
+            a = absint_wide_field([1.0, 2.0], 0.0), b = absint_wide_field([0.0, 0.0], 0.0),
+            c = absint_wide_field([0.0, 0.0], 0.0), d = absint_wide_field([3.0, 4.0], 2.0),
+        ),
+        0.0,
+    )
+    dm = Enzyme.make_zero(m)
+    autodiff(Reverse, absint_wide_loss, Active, Duplicated(m, dm))
+    @test dm.vel.a.data ≈ [6.0, 8.0]
+    @test dm.vel.d.data ≈ [2.0, 4.0]
+    @test dm.vel.d.pad[1] ≈ 11.0
+end
+
+Base.@noinline absint_undef_barrier(f, args...; kwargs...) = f(args...; kwargs...)
+
+struct AbsintAnyBox
+    fn::Any
+end
+(box::AbsintAnyBox)(a, b) = box.fn(a, b)
+
+struct AbsintTwoPtrs{T, C}
+    tunable::T
+    caches::C
+end
+
+struct AbsintPtrAndInt{U}
+    u::U
+    i::Int
+end
+
+function absint_undef_loss(p, box, s)
+    absint_undef_barrier(box, p, (s,))
+    return sum(p.tunable)
+end
+
+@testset "Absint memcpy from a stack slot that is never written" begin
+    # On 1.13 the tracked slots of `p` travel in a separate roots object, so SROA
+    # leaves the slice of the argument tuple's data half that would hold them
+    # unwritten and unread -- but still memcpys it into the varargs tuple. That
+    # copy reads only undefined bytes and has no type to find.
+    p = AbsintTwoPtrs([2.0], [0.0])
+    dp = Enzyme.make_zero(p)
+    s = AbsintPtrAndInt([1.0, 1.0], 0)
+    box = AbsintAnyBox((a, b) -> nothing)
+    autodiff(
+        set_runtime_activity(Reverse), Const(absint_undef_loss), Active,
+        Duplicated(p, dp), Const(box), Const(s),
+    )
+    @test dp.tunable == [1.0]
+    @test dp.caches == [0.0]
+end

@@ -68,6 +68,12 @@ const NoEffects = MemoryEffect(
     (MRI_NoModRef << getLocationPos(InaccessibleMem)) |
     (MRI_NoModRef << getLocationPos(Other)),
 )
+const ReadArgMemReadWriteInaccessibleEffects = MemoryEffect(
+    (MRI_Ref << getLocationPos(ArgMem)) |
+        (MRI_ModRef << getLocationPos(InaccessibleMem)) |
+        (MRI_NoModRef << getLocationPos(Other)),
+)
+
 const ReadArgMemWriteInaccessibleEffects = MemoryEffect(
     (MRI_Ref << getLocationPos(ArgMem)) |
     (MRI_Mod << getLocationPos(InaccessibleMem)) |
@@ -117,7 +123,7 @@ end
 function set_readonly(effect::MemoryEffect)::MemoryEffect
     data = UInt32(0)
     for loc in (ArgMem, InaccessibleMem, Other)
-        data = UInt32(set_readonly(getModRef(effect, loc))) << getLocationPos(loc)
+        data |= UInt32(set_readonly(getModRef(effect, loc))) << getLocationPos(loc)
     end
     return MemoryEffect(data)
 end
@@ -414,6 +420,74 @@ function reinsert_gcmarker!(func::LLVM.Function, @nospecialize(PB::Union{Nothing
     end
 end
 
+# `offsetof(jl_task_t, gcstack)`, which is fixed for a build of Julia. Declaring it foldable
+# lets inference turn the load into a constant.
+Base.@assume_effects :foldable :nothrow task_gcstack_offset() = Int(unsafe_load(cglobal(:jl_task_gcstack_offset, Cint)))
+
+"""
+    current_pgcstack() -> Ptr{Cvoid}
+
+Give the pgcstack of the running task, for an llvmcall that takes it as an argument (see
+[`use_gcstack_arg!`](@ref)).
+
+Julia computes `current_task()` from the pgcstack of the function that this is inlined into
+(on 1.13 that is the `"gcstack"` argument of the function). So the function gets no
+`julia.get_pgcstack` call from this. An llvmcall of `julia.get_pgcstack` would not do: Julia
+inlines it where it is called, which is the problem that [`use_gcstack_arg!`](@ref) avoids.
+"""
+@inline current_pgcstack() = pointer_from_objref(current_task()) + task_gcstack_offset()
+
+"""
+    use_gcstack_arg!(f::LLVM.Function, arg::LLVM.Argument)
+
+Make the llvmcall `f` use its argument `arg` as the pgcstack of the code it inlines. The
+caller gives this argument with [`current_pgcstack`](@ref), as a `Ptr{Cvoid}`.
+
+Julia inlines an llvmcall into its caller, together with the `alwaysinline` functions that
+the llvmcall calls. A `julia.get_pgcstack` call in that code thus goes into the middle of
+the caller. On 1.13 the caller takes its pgcstack as its own `"gcstack"` argument. But the
+GC lowering prefers a `julia.get_pgcstack` call in the entry block to that argument, and
+pushes the GC frame of the caller only after the call. Then no safepoint before the call
+has the roots of the caller.
+
+Thus inline the `alwaysinline` functions into `f` here, and replace every
+`julia.get_pgcstack` call in `f` with `arg`, as `LowerPTLS` does for a function that takes
+its pgcstack as an argument.
+"""
+function use_gcstack_arg!(f::LLVM.Function, arg::LLVM.Argument)
+    mod = LLVM.parent(f)
+    run!(AlwaysInlinerPass(), mod)
+    if !haskey(functions(mod), "julia.get_pgcstack")
+        return
+    end
+    getter = functions(mod)["julia.get_pgcstack"]
+    calls = LLVM.CallInst[]
+    for use in uses(getter)
+        call = user(use)
+        if call isa LLVM.CallInst && LLVM.parent(LLVM.parent(call)) == f
+            push!(calls, call)
+        end
+    end
+    if isempty(calls)
+        return
+    end
+    B = IRBuilder()
+    position!(B, first(instructions(first(blocks(f)))))
+    T_pgcstack = LLVM.return_type(LLVM.function_type(getter))
+    # Before 1.12, a `Ptr{Cvoid}` is an integer in Julia's IR.
+    pgcstack = if value_type(arg) isa LLVM.IntegerType
+        inttoptr!(B, arg, T_pgcstack)
+    else
+        bitcast!(B, arg, T_pgcstack)
+    end
+    dispose(B)
+    for call in calls
+        replace_uses!(call, pgcstack)
+        LLVM.API.LLVMInstructionEraseFromParent(call)
+    end
+    return
+end
+
 @inline enum_attr_kind(kind::String) = LLVM.API.LLVMGetEnumAttributeKindForName(kind, Csize_t(length(kind)))
 
 const swiftself_kind = enum_attr_kind("swiftself")
@@ -500,6 +574,39 @@ Base.@assume_effects :removable :foldable :nothrow function has_arg_attr(fn::LLV
         end
     end
     return false
+end
+
+"""
+    precedes(a, b)
+
+Whether instruction `a` comes before `b` in their common basic block.
+"""
+function precedes(a::LLVM.Instruction, b::LLVM.Instruction)::Bool
+    @assert LLVM.parent(a) == LLVM.parent(b)
+    for inst in instructions(LLVM.parent(a))
+        inst == a && return true
+        inst == b && return false
+    end
+    return false
+end
+
+"""
+    copy_metadata!(dst, src)
+
+Attach every metadata node of the instruction `src`, except its debug location,
+to `dst`.
+"""
+function copy_metadata!(dst::LLVM.Instruction, src::LLVM.Instruction)
+    num = Ref{Csize_t}()
+    entries = LLVM.API.LLVMInstructionGetAllMetadataOtherThanDebugLoc(src, num)
+    ctx = LLVM.context(src)
+    for i in 1:num[]
+        kind = LLVM.API.LLVMValueMetadataEntriesGetKind(entries, i - 1)
+        md = LLVM.API.LLVMValueMetadataEntriesGetMetadata(entries, i - 1)
+        LLVM.API.LLVMSetMetadata(dst, kind, LLVM.API.LLVMMetadataAsValue(ctx, md))
+    end
+    num[] > 0 && LLVM.API.LLVMDisposeValueMetadataEntries(entries)
+    return nothing
 end
 
 function eraseInst(bb::LLVM.BasicBlock, @nospecialize(inst::LLVM.Instruction))

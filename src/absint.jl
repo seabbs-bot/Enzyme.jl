@@ -13,6 +13,22 @@ function unbind(@nospecialize(val))
    end
 end
 
+"""
+    abs_ntuple_type(arg::LLVM.Value) -> Union{Nothing, Tuple{LLVM.Value, Any}}
+
+If `arg` is a call `julia.enzyme.ntuple_type(T, count)` with `T` known
+statically, return `(count, T)`; otherwise `nothing`.
+"""
+function abs_ntuple_type(@nospecialize(arg::LLVM.Value))::Union{Nothing, Tuple{LLVM.Value, Any}}
+    isa(arg, LLVM.CallInst) || return nothing
+    fn = LLVM.called_operand(arg)
+    isa(fn, LLVM.Function) || return nothing
+    LLVM.name(fn) == "julia.enzyme.ntuple_type" || return nothing
+    legal, T = absint(operands(arg)[1])
+    legal || return nothing
+    return (operands(arg)[2], unbind(T))
+end
+
 function absint(@nospecialize(arg::LLVM.Value), partial::Bool = false, istracked::Bool=false, typetag::Bool=false)::Tuple{Bool, Any}
     if (value_type(arg) == LLVM.PointerType(LLVM.StructType(LLVMType[]), Tracked)) || (value_type(arg) == LLVM.PointerType(LLVM.StructType(LLVMType[]), Derived)) || istracked
         ce, _ = get_base_and_offset(arg; offsetAllowed = false, inttoptr = true)
@@ -110,6 +126,16 @@ function absint(@nospecialize(arg::LLVM.Value), partial::Bool = false, istracked
         if nm == "jl_typeof" || nm == "ijl_typeof"
             vals = abs_typeof(operands(arg)[1], partial)
             return (vals[1], vals[2])
+        end
+        ntuple = abs_ntuple_type(arg)
+        if ntuple !== nothing
+            count, T = ntuple
+            if isa(count, LLVM.ConstantInt)
+                return (true, NTuple{convert(Int, count), T})
+            elseif partial
+                N = TypeVar(Symbol("sarg" * string(count)))
+                return (true, UnionAll(N, NTuple{N, T}))
+            end
         end
         if LLVM.callconv(arg) == 37 || nm == "julia.call"
             index = 1
@@ -700,10 +726,10 @@ function abs_typeof(
             end
             if !Base.allocatedinline(typ) && cholmod_exception
                 shouldLoad = false
-                offset %= sizeof(Int)
+                offset = Base.mod(offset, sizeof(Int))
             else
                 sz = max(1, actual_size(ET))
-                offset %= sz
+                offset = Base.mod(offset, sz)
             end
         end
 

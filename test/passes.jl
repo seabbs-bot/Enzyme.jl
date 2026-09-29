@@ -232,7 +232,7 @@ end
         Enzyme.Compiler.autodiff_cache[ptr] = ("thunk", bitcode)
         try
             Enzyme.@with Enzyme.Compiler.ENZYME_CONTEXT =>
-                    Enzyme.Compiler.EnzymeContext() begin
+                    Enzyme.Compiler.EnzymeContext(GPUCompiler.tls_world_age()) begin
                 FT = LLVM.FunctionType(LLVM.Int64Type(), [LLVM.Int64Type()])
 
                 first_mod = LLVM.Module("first")
@@ -727,5 +727,231 @@ end
         @test !Enzyme.Compiler.is_readonly(LLVM.called_operand(cmp)::LLVM.Function)
 
         @test_throws AssertionError Enzyme.Compiler.fix_decayaddr!(mod)
+    end
+end
+
+@testset "fix_decayaddr! derived pointer into a heap-promoted roots buffer" begin
+    # Since Julia 1.13.1, codegen passes a pointer into a `returnRoots` buffer
+    # on as another call's roots argument. When Enzyme moves that buffer to the
+    # GC heap, the argument becomes a derived pointer into the new object, cast
+    # back to addrspace 0. The roots must be copied into a stack slot instead.
+    rooted = string(convert(UInt, pointer_from_objref(Tuple{Vector{Float64}, Int})))
+    LLVM.Context() do ctx
+        if LLVM.supports_typed_pointers(ctx)
+            return
+        end
+        mod = parse(
+            LLVM.Module, """
+            source_filename = "start"
+            target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12:13"
+            target triple = "x86_64-linux-gnu"
+
+            declare noalias nonnull ptr addrspace(10) @julia.gc_alloc_obj(ptr, i64, ptr addrspace(10))
+
+            declare void @use_roots(ptr nocapture readonly "enzymejl_rooted_typ"="$rooted")
+
+            define void @promoted() {
+            top:
+              %obj = call noalias nonnull ptr addrspace(10) @julia.gc_alloc_obj(ptr null, i64 32, ptr addrspace(10) null)
+              %derived = addrspacecast ptr addrspace(10) %obj to ptr addrspace(11)
+              %slot = getelementptr i8, ptr addrspace(11) %derived, i64 8
+              %decayed = addrspacecast ptr addrspace(11) %slot to ptr
+              call void @use_roots(ptr nocapture readonly %decayed)
+              ret void
+            }
+
+            define void @untracked(ptr addrspace(11) %arg) {
+            top:
+              %decayed = addrspacecast ptr addrspace(11) %arg to ptr
+              call void @use_roots(ptr nocapture readonly %decayed)
+              ret void
+            }
+            """
+        )
+        @test @filecheck begin
+            @check_label "@promoted"
+            @check "%[[TMP:[0-9]+]] = alloca [1 x ptr addrspace(10)]"
+            @check "%[[SLOT:.+]] = getelementptr i8, ptr addrspace(11)"
+            @check "load [1 x ptr addrspace(10)], ptr addrspace(11) %[[SLOT]]"
+            @check "store [1 x ptr addrspace(10)] {{.*}}, ptr %[[TMP]]"
+            @check "call void @use_roots(ptr nocapture readonly %[[TMP]])"
+            # A derived pointer that does not trace back to a tracked object
+            # is left alone.
+            @check_label "@untracked"
+            @check "addrspacecast ptr addrspace(11) %arg to ptr"
+            Enzyme.Compiler.fix_decayaddr!(mod)
+            string(mod)
+        end
+    end
+end
+
+# --- unfold_root_phi_loads! ---------------------------------------------------
+
+function root_phi_addrspaces(f::LLVM.Function)
+    spaces = Int[]
+    for bb in blocks(f), inst in instructions(bb)
+        if isa(inst, LLVM.PHIInst)
+            push!(spaces, Int(LLVM.addrspace(value_type(inst))))
+        end
+    end
+    return spaces
+end
+
+@testset "unfold_root_phi_loads!" begin
+    LLVM.Context() do ctx
+        mod = parse(
+            LLVM.Module, """
+            source_filename = "start"
+            target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12:13"
+            target triple = "x86_64-linux-gnu"
+
+            define {} addrspace(10)* @diamond(i1 %cond, {} addrspace(10)** %arg) {
+            top:
+              %roots = alloca [2 x {} addrspace(10)*], align 8
+              %r = bitcast [2 x {} addrspace(10)*]* %roots to {} addrspace(10)**
+              br i1 %cond, label %a, label %b
+
+            a:
+              br label %merge
+
+            b:
+              br label %merge
+
+            merge:
+              %p = phi {} addrspace(10)** [ %r, %a ], [ %arg, %b ]
+              %ld = load {} addrspace(10)*, {} addrspace(10)** %p, align 8
+              ret {} addrspace(10)* %ld
+            }
+
+            define {} addrspace(10)* @selfref(i1 %cond) {
+            top:
+              %roots = alloca [2 x {} addrspace(10)*], align 8
+              %r = bitcast [2 x {} addrspace(10)*]* %roots to {} addrspace(10)**
+              br label %header
+
+            header:
+              %p = phi {} addrspace(10)** [ %r, %top ], [ %p, %latch ]
+              %ld = load {} addrspace(10)*, {} addrspace(10)** %p, align 8
+              br i1 %cond, label %latch, label %exit
+
+            latch:
+              br label %header
+
+            exit:
+              ret {} addrspace(10)* %ld
+            }
+
+            define {} addrspace(10)* @selfref_gep(i1 %cond) {
+            top:
+              %roots = alloca [2 x {} addrspace(10)*], align 8
+              %r = bitcast [2 x {} addrspace(10)*]* %roots to {} addrspace(10)**
+              br label %header
+
+            header:
+              %p = phi {} addrspace(10)** [ %r, %top ], [ %g, %latch ]
+              %g = getelementptr inbounds {} addrspace(10)*, {} addrspace(10)** %p, i64 1
+              %ld = load {} addrspace(10)*, {} addrspace(10)** %g, align 8
+              br i1 %cond, label %latch, label %exit
+
+            latch:
+              br label %header
+
+            exit:
+              ret {} addrspace(10)* %ld
+            }
+            """
+        )
+
+        # The pass replaces the phi of root-array pointers with a phi of loads.
+        diamond = functions(mod)["diamond"]
+        @test root_phi_addrspaces(diamond) == [0]
+        @test Enzyme.Compiler.unfold_root_phi_loads!(diamond)
+        @test root_phi_addrspaces(diamond) == [10]
+
+        # The phi gets a value from its own block, and that value is the phi.
+        # The pass must not change this function.
+        selfref = functions(mod)["selfref"]
+        @test !Enzyme.Compiler.unfold_root_phi_loads!(selfref)
+        @test root_phi_addrspaces(selfref) == [0]
+
+        # The same, but the value from its own block is a GEP of the phi.
+        selfref_gep = functions(mod)["selfref_gep"]
+        @test !Enzyme.Compiler.unfold_root_phi_loads!(selfref_gep)
+        @test root_phi_addrspaces(selfref_gep) == [0]
+
+        @test LLVM.verify(mod) === nothing
+    end
+end
+
+@testset "addrspace(11) argument phis are left alone" begin
+    # LLVM 20 strength-reduces loop indices into pointer induction variables, so a
+    # loop over an addrspace(11) argument (an SVector passed by reference) becomes
+    # `phi [ %arg, %top ], [ gep(%inv, %iv), %latch ]` with a non-constant GEP index.
+    # There is no addrspace(10) object to root such a phi with; `nodecayed_phis!`
+    # must skip it instead of failing in `nodecayed_getparent`.
+    @test @filecheck begin
+        @check_label "define double @loop"
+        @check_not "nodecayed."
+        @check "%p = phi"
+        @check_not "nodecayed."
+        @check_label "define double @sel"
+        @check_not "nodecayed."
+        @check "%p = phi"
+        @check_not "nodecayed."
+        LLVM.Context() do ctx
+            mod = parse(
+                LLVM.Module, """
+                define double @loop(double addrspace(11)* %arg, i64 %n) {
+                top:
+                  %inv = getelementptr double, double addrspace(11)* %arg, i64 -1
+                  br label %loop
+
+                loop:
+                  %p = phi double addrspace(11)* [ %arg, %top ], [ %gep, %latch ]
+                  %iv = phi i64 [ 1, %top ], [ %ivnext, %latch ]
+                  %acc = phi double [ 0.0, %top ], [ %accnext, %latch ]
+                  %v = load double, double addrspace(11)* %p, align 8
+                  %accnext = fadd double %acc, %v
+                  %done = icmp eq i64 %iv, %n
+                  br i1 %done, label %exit, label %latch
+
+                latch:
+                  %ivnext = add i64 %iv, 1
+                  %gep = getelementptr double, double addrspace(11)* %inv, i64 %ivnext
+                  br label %loop
+
+                exit:
+                  ret double %accnext
+                }
+
+                define double @sel(double addrspace(11)* %a, double addrspace(11)* %b, i1 %c, i64 %n) {
+                top:
+                  %b1 = getelementptr double, double addrspace(11)* %b, i64 1
+                  %s = select i1 %c, double addrspace(11)* %a, double addrspace(11)* %b1
+                  br label %loop
+
+                loop:
+                  %p = phi double addrspace(11)* [ %s, %top ], [ %gep, %latch ]
+                  %iv = phi i64 [ 1, %top ], [ %ivnext, %latch ]
+                  %acc = phi double [ 0.0, %top ], [ %accnext, %latch ]
+                  %v = load double, double addrspace(11)* %p, align 8
+                  %accnext = fadd double %acc, %v
+                  %done = icmp eq i64 %iv, %n
+                  br i1 %done, label %exit, label %latch
+
+                latch:
+                  %ivnext = add i64 %iv, 1
+                  %gep = getelementptr double, double addrspace(11)* %p, i64 %ivnext
+                  br label %loop
+
+                exit:
+                  ret double %accnext
+                }
+                """
+            )
+
+            Enzyme.Compiler.nodecayed_phis!(mod)
+            string(mod)
+        end
     end
 end
